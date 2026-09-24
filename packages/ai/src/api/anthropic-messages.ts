@@ -95,6 +95,11 @@ function getCacheControl(
 // Stealth mode: Mimic Claude Code's tool naming exactly
 const claudeCodeVersion = "2.1.280";
 
+// Anthropic can answer 200 to extra-usage (overage) requests and then send only pings.
+const HELD_REQUEST_TIMEOUT_MS = 45_000;
+// "timed out" is what makes this retryable (see utils/retry.ts).
+const HELD_REQUEST_ERROR = `Anthropic sent no response within ${HELD_REQUEST_TIMEOUT_MS / 1000}s of headers (timed out)`;
+
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
 // To update: https://github.com/badlogic/cchistory
@@ -597,6 +602,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			stopReason: "pending",
 			timestamp: Date.now(),
 		};
+		const heldController = new AbortController();
+		const requestSignal = options?.signal
+			? AbortSignal.any([options.signal, heldController.signal])
+			: heldController.signal;
+		let heldTimer: ReturnType<typeof setTimeout> | undefined;
 
 		try {
 			let client: Anthropic;
@@ -642,7 +652,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
 			}
 			const requestOptions = {
-				...(options?.signal ? { signal: options.signal } : {}),
+				signal: requestSignal,
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
@@ -656,11 +666,19 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
+			if (
+				isOAuth &&
+				URL.parse(model.baseUrl)?.hostname === "api.anthropic.com" &&
+				response.headers.get("anthropic-ratelimit-unified-overage-in-use") === "true"
+			) {
+				heldTimer = setTimeout(() => heldController.abort(), HELD_REQUEST_TIMEOUT_MS);
+			}
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
 
-			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
+			for await (const event of iterateAnthropicEvents(response, requestSignal)) {
+				clearTimeout(heldTimer);
 				await options?.onProviderStreamEvent?.(event, model);
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
@@ -891,9 +909,16 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage =
+				heldController.signal.aborted && !options?.signal?.aborted
+					? HELD_REQUEST_ERROR
+					: error instanceof Error
+						? error.message
+						: JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			clearTimeout(heldTimer);
 		}
 	})();
 

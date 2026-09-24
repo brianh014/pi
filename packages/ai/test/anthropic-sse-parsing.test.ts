@@ -1,10 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { transformMessages } from "../src/api/transform-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Api, Model, ToolCall } from "../src/types.ts";
+import { isRetryableAssistantError } from "../src/utils/retry.ts";
 
 function createSseResponse(events: Array<{ event: string; data: string }>): Response {
 	const body = events.map(({ event, data }) => `event: ${event}\ndata: ${data}\n`).join("\n");
@@ -696,5 +697,161 @@ describe("Anthropic raw SSE parsing", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
 		expect(result.content).toEqual([{ type: "text", text: "Hello" }]);
+	});
+});
+
+describe("anthropic held requests", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	function openStream(apiKey = "sk-ant-oat01-test", overage = true) {
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const body = new ReadableStream<Uint8Array>({
+			start(c) {
+				controller = c;
+			},
+		});
+		const state = { aborted: false };
+		const fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+			// Real fetch errors a pending body read on abort.
+			init?.signal?.addEventListener("abort", () => {
+				state.aborted = true;
+				controller.error(new DOMException("This operation was aborted", "AbortError"));
+			});
+			const headers: Record<string, string> = { "content-type": "text/event-stream" };
+			if (overage) headers["anthropic-ratelimit-unified-overage-in-use"] = "true";
+			return new Response(body, { status: 200, headers });
+		};
+		const push = (event: string, data: string) =>
+			controller.enqueue(new TextEncoder().encode(`event: ${event}\ndata: ${data}\n\n`));
+		return { options: { fetch, apiKey }, push, close: () => controller.close(), state };
+	}
+
+	const model = getModel("anthropic", "claude-haiku-4-5") as Model<"anthropic-messages">;
+	const context = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
+
+	it("ends a request that only receives pings as a retryable error", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, state } = openStream();
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		await vi.advanceTimersByTimeAsync(45_000);
+		const message = await result;
+
+		expect(state.aborted).toBe(true);
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("Anthropic sent no response");
+		expect(isRetryableAssistantError(message)).toBe(true);
+	});
+
+	it("does not end a started response that pauses longer than the held-request timeout", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, close, state } = openStream();
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		for (const event of minimalAnthropicEvents.slice(0, 3)) push(event.event, event.data);
+		await vi.advanceTimersByTimeAsync(120_000);
+		for (const event of minimalAnthropicEvents.slice(3)) push(event.event, event.data);
+		close();
+		const message = await result;
+
+		expect(state.aborted).toBe(false);
+		expect(message.stopReason).toBe("stop");
+		expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
+	});
+
+	it("reports a user abort during a held request as aborted", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, state } = openStream();
+		const userAbort = new AbortController();
+		const result = streamAnthropic(model, context, { ...options, signal: userAbort.signal }).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		await vi.advanceTimersByTimeAsync(10_000);
+		userAbort.abort();
+		const message = await result;
+
+		expect(state.aborted).toBe(true);
+		expect(message.stopReason).toBe("aborted");
+		expect(message.errorMessage).not.toContain("Anthropic sent no response");
+	});
+
+	it("does not apply to an anthropic provider whose baseUrl points at a proxy", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, close, state } = openStream();
+		const proxyModel = { ...model, baseUrl: "https://llm-gateway.example.com" } as Model<"anthropic-messages">;
+		const result = streamAnthropic(proxyModel, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		await vi.advanceTimersByTimeAsync(120_000);
+		for (const event of minimalAnthropicEvents) push(event.event, event.data);
+		close();
+		const message = await result;
+
+		expect(state.aborted).toBe(false);
+		expect(message.stopReason).toBe("stop");
+	});
+
+	it("does not apply to API-key requests", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, close, state } = openStream("sk-ant-api03-test");
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		await vi.advanceTimersByTimeAsync(120_000);
+		for (const event of minimalAnthropicEvents) push(event.event, event.data);
+		close();
+		const message = await result;
+
+		expect(state.aborted).toBe(false);
+		expect(message.stopReason).toBe("stop");
+	});
+
+	it("does not apply when the response is not overage traffic", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, close, state } = openStream(undefined, false);
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		await vi.advanceTimersByTimeAsync(120_000);
+		for (const event of minimalAnthropicEvents) push(event.event, event.data);
+		close();
+		const message = await result;
+
+		expect(state.aborted).toBe(false);
+		expect(message.stopReason).toBe("stop");
+	});
+
+	it("stops the held-request timer on the first event even without message_start", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push, close, state } = openStream();
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		for (const event of minimalAnthropicEvents.slice(1, 3)) push(event.event, event.data);
+		await vi.advanceTimersByTimeAsync(120_000);
+		for (const event of minimalAnthropicEvents.slice(3)) push(event.event, event.data);
+		close();
+		const message = await result;
+
+		expect(state.aborted).toBe(false);
+		expect(message.stopReason).toBe("stop");
+		expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
+	});
+
+	it("keeps the real error text when Anthropic sends an error event while held", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const { options, push } = openStream();
+		const result = streamAnthropic(model, context, options).result();
+		await vi.advanceTimersByTimeAsync(0);
+		push("ping", '{"type":"ping"}');
+		push("error", '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
+		const message = await result;
+
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("overloaded_error");
+		expect(message.errorMessage).not.toContain("Anthropic sent no response");
+		expect(vi.getTimerCount()).toBe(0);
 	});
 });

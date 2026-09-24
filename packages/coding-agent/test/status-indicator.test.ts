@@ -95,6 +95,36 @@ describe("status indicators", () => {
 		}
 	});
 
+	it("shows the first line of the retry reason, without ANSI and capped in width", () => {
+		initTheme("dark");
+		const tui = { requestRender: vi.fn() } as unknown as TUI;
+		const reason = `\x1b[31m${"x".repeat(200)}\x1b[0m\nsecond line`;
+		const indicator = new RetryStatusIndicator(tui, 1, 3, 1000, reason);
+		try {
+			const line = stripAnsi(indicator.render(400)[1]!);
+			const shown = line.match(/in 1s: (.*) \(/)![1]!;
+			expect(shown).toMatch(/^x+\.\.\.$/);
+			expect(visibleWidth(shown)).toBe(80);
+			expect(line).not.toContain("second line");
+		} finally {
+			indicator.dispose();
+		}
+	});
+
+	it("strips carriage returns and control characters from the retry reason", () => {
+		initTheme("dark");
+		const tui = { requestRender: vi.fn() } as unknown as TUI;
+		const indicator = new RetryStatusIndicator(tui, 1, 3, 1000, "520 bad\x07\bgateway\r\n<html>");
+		try {
+			const line = indicator.render(400)[1]!;
+			expect(line).not.toMatch(/[\r\x07\b]/);
+			expect(stripAnsi(line)).toContain("in 1s: 520 bad gateway (");
+			expect(line).not.toContain("<html>");
+		} finally {
+			indicator.dispose();
+		}
+	});
+
 	it("disposes retry countdown updates", () => {
 		initTheme("dark");
 		vi.useFakeTimers();
