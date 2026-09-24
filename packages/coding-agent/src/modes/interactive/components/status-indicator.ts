@@ -1,5 +1,6 @@
 import { type Component, Loader, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
 import type { WorkingIndicatorOptions } from "../../../core/extensions/index.ts";
+import { stripAnsi } from "../../../utils/ansi.ts";
 import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
 import { keyText } from "./keybinding-hints.ts";
@@ -51,9 +52,17 @@ export class WorkingStatusIndicator extends StatusIndicator {
 export class RetryStatusIndicator extends StatusIndicator {
 	private countdown: CountdownTimer | undefined;
 
-	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number) {
+	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number, reason?: string) {
+		const suffix = reason
+			? `: ${truncateToWidth(
+					stripAnsi(reason)
+						.split(/\r\n|\r|\n/)[0]
+						.replace(/[\x00-\x1f\x7f]+/g, " "),
+					80,
+				)}`
+			: "";
 		const retryMessage = (seconds: number) =>
-			`Retrying (${attempt}/${maxAttempts}) in ${seconds}s... (${keyText("app.interrupt")} to cancel)`;
+			`Retrying (${attempt}/${maxAttempts}) in ${seconds}s${suffix || "..."} (${keyText("app.interrupt")} to cancel)`;
 		super(
 			"retry",
 			ui,
